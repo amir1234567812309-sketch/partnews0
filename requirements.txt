@@ -1,1 +1,1227 @@
+# -*- coding: utf-8 -*-
+import requests, time, sqlite3, logging, random, re, os
+import xml.etree.ElementTree as ET
+from datetime import datetime, timedelta
+from html import unescape
 
+TOKEN = os.getenv("BOT_TOKEN", "1519375774:q9cbPFOr9r41YdCJUJdOHHbyeOxurJSchOs")
+ADMIN_ID = int(os.getenv("ADMIN_ID", "1196063545"))
+BOT_USERNAME = "partnews2bot"
+DAILY_REWARD, REF_REWARD, QUIZ_REWARD, WELCOME_BONUS = 5, 10, 2, 8
+NEWS_INTERVAL = 30 * 60
+RSS_SOURCES = [
+    ("ایسنا", "https://www.isna.ir/rss"),
+    ("انتخاب", "https://www.entekhab.ir/fa/rss/allnews"),
+    ("ایمنا", "https://www.imna.ir/rss"),
+]
+API = f"https://tapi.bale.ai/bot{TOKEN}/"
+DB = "partnews.db"
+logging.basicConfig(level=logging.INFO)
+log = logging.getLogger("PN")
+state = {}
+last_news_fetch = 0
+last_action = {}
+
+LEVELS = [(0,"🌱 تازه‌وارد"),(25,"⭐ فعال"),(60,"🔥 خبرنگار"),(120,"💎 حرفه‌ای"),(250,"👑 افسانه‌ای")]
+TITLES_SHOP = [
+    ("t1", "🎖 خبرنگار ویژه", 40),
+    ("t2", "👑 افسانه اخبار", 80),
+    ("t3", "🥷 شکارچی خبر", 55),
+    ("t4", "🚀 ستاره پارت", 30),
+    ("t5", "💎 الماس خبر", 100),
+]
+IMPORTANT = re.compile(
+    r"دولت|رئیس.?جمهور|وزیر|مجلس|توافق|تحریم|جنگ|حمله|زلزله|سیل|بحران|اقتصاد|بورس|دلار|تورم|نفت|"
+    r"امنیت|نظامی|دادگاه|انتخابات|استعفا|قانون|سلامت|تیم.?ملی|مدال|رکورد|کشته|انفجار|دیپلماسی|"
+    r"سازمان.?ملل|آمریکا|اروپا|چین|روسیه|اسرائیل|غزه|فوری|رسمی", re.I)
+JUNK = re.compile(
+    r"تبلیغ|آگهی|پیش.?بینی.?هوا|جدول.?لیگ|فال|طالع|آشپزی|دکوراسیون|مد و لباس|تخفیف|قرعه.?کشی.?فروشگاهی", re.I)
+
+def db():
+    c = sqlite3.connect(DB, check_same_thread=False)
+    c.row_factory = sqlite3.Row
+    return c
+
+def init_db():
+    c = db()
+    c.executescript("""
+    CREATE TABLE IF NOT EXISTS users(
+        user_id INTEGER PRIMARY KEY, first_name TEXT, username TEXT,
+        points INTEGER DEFAULT 0, referrer_id INTEGER, referral_count INTEGER DEFAULT 0,
+        last_daily TEXT, streak INTEGER DEFAULT 0, quiz_ok INTEGER DEFAULT 0, quiz_all INTEGER DEFAULT 0,
+        quiz_combo INTEGER DEFAULT 0, best_combo INTEGER DEFAULT 0,
+        last_lucky TEXT, last_challenge TEXT, title TEXT DEFAULT '',
+        banned INTEGER DEFAULT 0, joined_at TEXT, last_active TEXT);
+    CREATE TABLE IF NOT EXISTS news(
+        id INTEGER PRIMARY KEY AUTOINCREMENT, kind TEXT, title TEXT, body TEXT,
+        link TEXT, source TEXT, score INTEGER DEFAULT 0, is_published INTEGER DEFAULT 1, created_at TEXT);
+    CREATE TABLE IF NOT EXISTS quiz_state(
+        user_id INTEGER PRIMARY KEY, category TEXT, qindex INTEGER DEFAULT 0, correct_pos INTEGER DEFAULT 0);
+    CREATE TABLE IF NOT EXISTS word_state(user_id INTEGER PRIMARY KEY, word TEXT);
+    CREATE TABLE IF NOT EXISTS support(
+        id INTEGER PRIMARY KEY AUTOINCREMENT, user_id INTEGER, message TEXT, created_at TEXT, answered INTEGER DEFAULT 0);
+    CREATE TABLE IF NOT EXISTS achievements(
+        user_id INTEGER, code TEXT, unlocked_at TEXT, PRIMARY KEY(user_id, code));
+    CREATE TABLE IF NOT EXISTS inventory(user_id INTEGER, item TEXT, PRIMARY KEY(user_id, item));
+    CREATE TABLE IF NOT EXISTS challenge(day TEXT PRIMARY KEY, cat TEXT, qindex INTEGER, text TEXT);
+    CREATE TABLE IF NOT EXISTS channels(username TEXT PRIMARY KEY, title TEXT);
+    CREATE TABLE IF NOT EXISTS settings(key TEXT PRIMARY KEY, value TEXT);
+    """)
+    for s in [
+        "ALTER TABLE users ADD COLUMN banned INTEGER DEFAULT 0",
+        "ALTER TABLE users ADD COLUMN title TEXT DEFAULT ''",
+        "ALTER TABLE users ADD COLUMN last_lucky TEXT",
+        "ALTER TABLE users ADD COLUMN last_challenge TEXT",
+        "ALTER TABLE users ADD COLUMN quiz_combo INTEGER DEFAULT 0",
+        "ALTER TABLE users ADD COLUMN best_combo INTEGER DEFAULT 0",
+        "ALTER TABLE news ADD COLUMN link TEXT",
+        "ALTER TABLE news ADD COLUMN source TEXT",
+        "ALTER TABLE news ADD COLUMN score INTEGER DEFAULT 0",
+        "ALTER TABLE quiz_state ADD COLUMN correct_pos INTEGER DEFAULT 0",
+        "ALTER TABLE support ADD COLUMN answered INTEGER DEFAULT 0",
+    ]:
+        try: c.execute(s)
+        except Exception: pass
+    if not c.execute("SELECT 1 FROM channels LIMIT 1").fetchone():
+        c.execute("INSERT OR IGNORE INTO channels(username,title) VALUES(?,?)", ("partnews", "📢 کانال اخبار"))
+        c.execute("INSERT OR IGNORE INTO channels(username,title) VALUES(?,?)", ("partmusic12", "🎵 کانال موسیقی"))
+    c.commit(); c.close()
+
+def get_setting(key, default=""):
+    c = db(); r = c.execute("SELECT value FROM settings WHERE key=?", (key,)).fetchone(); c.close()
+    return r["value"] if r else default
+
+def set_setting(key, value):
+    c = db()
+    c.execute("INSERT OR REPLACE INTO settings(key,value) VALUES(?,?)", (key, value))
+    c.commit(); c.close()
+
+def get_channels():
+    c = db(); rows = c.execute("SELECT username,title FROM channels ORDER BY username").fetchall(); c.close()
+    return [(r["username"], r["title"]) for r in rows]
+
+def api(m, p=None):
+    try:
+        r = requests.post(API + m, json=p or {}, timeout=20).json()
+        if not r.get("ok"): log.warning("%s %s", m, r)
+        return r
+    except Exception as e:
+        log.exception(e); return {"ok": False}
+
+def send(cid, text, kb=None):
+    d = {"chat_id": cid, "text": text}
+    if kb: d["reply_markup"] = kb
+    return api("sendMessage", d)
+
+def ans(cq):
+    api("answerCallbackQuery", {"callback_query_id": cq})
+
+def is_member(ch, uid):
+    r = api("getChatMember", {"chat_id": f"@{ch}", "user_id": uid})
+    return (r.get("result") or {}).get("status") in ("creator", "administrator", "member")
+
+def missing_ch(uid):
+    return [c for c in get_channels() if not is_member(c[0], uid)]
+
+def spam_ok(uid, sec=0.7):
+    now = time.time()
+    if now - last_action.get(uid, 0) < sec: return False
+    last_action[uid] = now
+    return True
+
+def level_of(p):
+    name = LEVELS[0][1]
+    for need, lab in LEVELS:
+        if p >= need: name = lab
+    return name
+
+def next_level(p):
+    for need, lab in LEVELS:
+        if p < need: return need - p, lab
+    return 0, LEVELS[-1][1]
+
+def news_score(title, body=""):
+    t = (title or "") + " " + (body or "")
+    if JUNK.search(t): return -10
+    sc = len(IMPORTANT.findall(t)) * 3
+    if len(title or "") >= 25: sc += 1
+    if any(x in t for x in ("فوری", "مهم", "رسمی", "اعلام کرد")): sc += 2
+    return sc
+
+def is_banned(uid):
+    u = user(uid)
+    return bool(u and u.get("banned"))
+
+def ensure(uid, name="", uname="", ref=None):
+    c = db(); now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    if c.execute("SELECT 1 FROM users WHERE user_id=?", (uid,)).fetchone():
+        c.execute("UPDATE users SET first_name=?,username=?,last_active=? WHERE user_id=?",
+                  (name, uname, now, uid)); c.commit(); c.close(); return False
+    c.execute(
+        """INSERT INTO users(user_id,first_name,username,points,referrer_id,referral_count,
+        streak,quiz_ok,quiz_all,quiz_combo,best_combo,title,banned,joined_at,last_active)
+        VALUES(?,?,?,?,?,0,0,0,0,0,0,'',0,?,?)""",
+        (uid, name, uname, WELCOME_BONUS, ref if ref != uid else None, now, now))
+    if ref and ref != uid and c.execute("SELECT 1 FROM users WHERE user_id=?", (ref,)).fetchone():
+        c.execute("UPDATE users SET points=points+?,referral_count=referral_count+1 WHERE user_id=?",
+                  (REF_REWARD, ref))
+        try:
+            send(ref,
+                 f"🎉 خبر خوب!\n\nیک نفر با لینک دعوت شما وارد ربات شد.\n"
+                 f"⭐ {REF_REWARD} امتیاز به حساب شما اضافه شد.\n\nاز دعوتتان متشکریم.")
+        except Exception: pass
+    c.commit(); c.close()
+    return True
+
+def pts(uid, n=0):
+    if n:
+        c = db(); c.execute("UPDATE users SET points=points+? WHERE user_id=?", (n, uid)); c.commit(); c.close()
+    c = db(); r = c.execute("SELECT points FROM users WHERE user_id=?", (uid,)).fetchone(); c.close()
+    return r["points"] if r else 0
+
+def user(uid):
+    c = db(); r = c.execute("SELECT * FROM users WHERE user_id=?", (uid,)).fetchone(); c.close()
+    return dict(r) if r else None
+
+def grant_ach(uid, code, title):
+    c = db()
+    if c.execute("SELECT 1 FROM achievements WHERE user_id=? AND code=?", (uid, code)).fetchone():
+        c.close(); return
+    c.execute("INSERT INTO achievements(user_id,code,unlocked_at) VALUES(?,?,?)",
+              (uid, code, datetime.now().strftime("%Y-%m-%d %H:%M:%S")))
+    c.execute("UPDATE users SET points=points+5 WHERE user_id=?", (uid,))
+    c.commit(); c.close()
+    try:
+        send(uid, f"🏅 دستاورد جدید باز شد!\n\n{title}\n⭐ ۵ امتیاز جایزه به حساب شما نشست.")
+    except Exception: pass
+
+def clean_html(t):
+    if not t: return ""
+    return re.sub(r"\s+", " ", unescape(re.sub(r"<[^>]+>", " ", t))).strip()
+# بخش ۲/۴ — اخبار، کیبورد، بانک سؤال و کلمه
+
+def fetch_one_rss(src, url, c):
+    added = 0
+    try:
+        r = requests.get(url, timeout=15, headers={"User-Agent": "PartNewsBot"})
+        r.raise_for_status()
+        ch = ET.fromstring(r.content).find("channel")
+        items = ch.findall("item") if ch is not None else []
+        for item in items[:12]:
+            title = clean_html((item.findtext("title") or "").strip())
+            desc = clean_html((item.findtext("description") or "").strip())
+            if not title: continue
+            if c.execute("SELECT id FROM news WHERE title=?", (title,)).fetchone(): continue
+            sc = news_score(title, desc)
+            if sc < 3: continue
+            c.execute(
+                "INSERT INTO news(kind,title,body,link,source,score,is_published,created_at) VALUES(?,?,?,?,?,?,1,?)",
+                ("pending", title[:300], desc[:500] or title, (item.findtext("link") or "").strip(),
+                 src, sc, datetime.now().strftime("%Y-%m-%d %H:%M:%S")))
+            added += 1
+    except Exception as e:
+        log.warning("RSS %s: %s", src, e)
+    return added
+
+def classify_news(c):
+    rows = c.execute(
+        "SELECT id,title,source,score FROM news WHERE is_published=1 AND kind IN ('pending','day','urgent') ORDER BY score DESC, id DESC LIMIT 20"
+    ).fetchall()
+    if not rows: return
+    c.execute("UPDATE news SET kind='day' WHERE kind IN ('urgent','day','pending')")
+    c.execute("UPDATE news SET kind='urgent' WHERE id=?", (rows[0]["id"],))
+    for r in rows[1:6]:
+        c.execute("UPDATE news SET kind='day' WHERE id=?", (r["id"],))
+    tops = rows[:4]
+    body = "━━━━━━━━━━━━━━\n📌 گزیده مهم‌ترین اخبار\n━━━━━━━━━━━━━━\n\n"
+    for i, x in enumerate(tops, 1):
+        body += f"{i}️⃣ {x['title']}\n"
+    srcs = sorted({x["source"] for x in tops if x["source"]})
+    body += "\n━━━━━━━━━━━━━━\n"
+    if srcs: body += f"منابع: {'، '.join(srcs)}\n"
+    body += f"آخرین بروزرسانی: {datetime.now():%H:%M}"
+    ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    old = c.execute("SELECT id FROM news WHERE kind='summary' ORDER BY id DESC LIMIT 1").fetchone()
+    if old:
+        c.execute("UPDATE news SET body=?,created_at=? WHERE id=?", (body, ts, old["id"]))
+    else:
+        c.execute("INSERT INTO news(kind,title,body,score,is_published,created_at) VALUES(?,?,?,99,1,?)",
+                  ("summary", "خلاصه", body, ts))
+
+def fetch_rss_news():
+    global last_news_fetch
+    now = time.time()
+    if now - last_news_fetch < NEWS_INTERVAL and last_news_fetch > 0: return
+    last_news_fetch = now
+    c = db(); total = 0
+    for name, url in RSS_SOURCES:
+        total += fetch_one_rss(name, url, c)
+    classify_news(c); c.commit(); c.close()
+    if total: log.info("RSS +%s", total)
+
+def join_kb():
+    rows = [[{"text": t, "url": f"https://ble.ir/{u}"}] for u, t in get_channels()]
+    rows.append([{"text": "✅ بررسی عضویت", "callback_data": "check_join"}])
+    return {"inline_keyboard": rows}
+
+def main_kb():
+    return {"keyboard": [
+        [{"text": "📰 اخبار"}, {"text": "🧠 مسابقه"}],
+        [{"text": "🎯 چالش روز"}, {"text": "☀️ گزارش من"}],
+        [{"text": "🎁 جایزه روزانه"}, {"text": "🎲 جعبه شانس"}],
+        [{"text": "🔤 کلمه"}, {"text": "🛒 فروشگاه"}],
+        [{"text": "👥 دعوت دوستان"}, {"text": "⭐ پروفایل"}],
+        [{"text": "🏆 برترین‌ها"}, {"text": "🏅 دستاوردها"}],
+        [{"text": "💡 راهنما"}, {"text": "👨‍💻 پشتیبانی"}]
+    ], "resize_keyboard": True}
+
+def news_kb():
+    return {"inline_keyboard": [
+        [{"text": "📰 خلاصه اخبار مهم", "callback_data": "n_sum"}],
+        [{"text": "🗞 مهم‌ترین خبر روز", "callback_data": "n_day"}],
+        [{"text": "🚨 خبر فوری", "callback_data": "n_urg"}],
+        [{"text": "🔄 بروزرسانی اخبار", "callback_data": "n_refresh"}],
+        [{"text": "🔙 بازگشت به منو", "callback_data": "back"}]
+    ]}
+
+def quiz_kb():
+    return {"inline_keyboard": [
+        [{"text": "🌍 جغرافیا", "callback_data": "q_geo"}, {"text": "🔬 علوم", "callback_data": "q_sci"}],
+        [{"text": "🏛 تاریخ", "callback_data": "q_hist"}, {"text": "⚽ ورزش", "callback_data": "q_sport"}],
+        [{"text": "🎬 سرگرمی", "callback_data": "q_fun"}, {"text": "📚 عمومی", "callback_data": "q_gen"}],
+        [{"text": "🎲 مسابقه ترکیبی", "callback_data": "q_mix"}],
+        [{"text": "🔙 بازگشت به منو", "callback_data": "back"}]
+    ]}
+
+def shop_kb():
+    rows = [[{"text": f"{n} — {p} امتیاز", "callback_data": f"buy:{c}"}] for c, n, p in TITLES_SHOP]
+    rows.append([{"text": "🔙 بازگشت به منو", "callback_data": "back"}])
+    return {"inline_keyboard": rows}
+
+def adm_kb():
+    return {"inline_keyboard": [
+        [{"text": "📊 آمار کامل", "callback_data": "a_stat"}],
+        [{"text": "📢 پیام همگانی", "callback_data": "a_bc"}],
+        [{"text": "📰 ثبت خبر روز", "callback_data": "a_day"}, {"text": "🚨 خبر فوری", "callback_data": "a_urg"}],
+        [{"text": "🔄 دریافت اخبار RSS", "callback_data": "a_rss"}],
+        [{"text": "📣 تنظیم تبلیغ استارت", "callback_data": "a_ad_set"}],
+        [{"text": "🗑 حذف تبلیغ استارت", "callback_data": "a_ad_del"}],
+        [{"text": "👁 مشاهده تبلیغ فعلی", "callback_data": "a_ad_view"}],
+        [{"text": "🔐 لیست کانال‌های قفل", "callback_data": "a_ch_list"}],
+        [{"text": "➕ افزودن کانال قفل", "callback_data": "a_ch_add"}],
+        [{"text": "➖ حذف کانال قفل", "callback_data": "a_ch_del"}],
+        [{"text": "⭐ دادن امتیاز به کاربر", "callback_data": "a_give"}],
+        [{"text": "🚫 مسدود کردن کاربر", "callback_data": "a_ban"}],
+        [{"text": "✅ رفع مسدودی کاربر", "callback_data": "a_unban"}],
+        [{"text": "📬 پشتیبانی‌های باز", "callback_data": "a_support"}],
+        [{"text": "🔙 خروج از پنل", "callback_data": "back"}]
+    ]}
+
+QUIZ = {
+"geo": [
+    ("پایتخت ایران کدام شهر است؟", ["تهران", "اصفهان", "شیراز", "مشهد"], 0),
+    ("بزرگ‌ترین اقیانوس جهان کدام است؟", ["آرام", "اطلس", "هند", "منجمد شمالی"], 0),
+    ("بلندترین قله ایران کدام است؟", ["دماوند", "سبلان", "تفتان", "الوند"], 0),
+    ("کدام دریاچه کاملاً داخل خاک ایران قرار دارد؟", ["ارومیه", "خزر", "عمان", "عرب"], 0),
+    ("پرجمعیت‌ترین کشور جهان کدام است؟", ["هند", "آمریکا", "روسیه", "برزیل"], 0),
+    ("پایتخت فرانسه کدام شهر است؟", ["پاریس", "لیون", "مارسی", "نیس"], 0),
+    ("طولانی‌ترین رود جهان کدام است؟", ["نیل", "آمازون", "دانوب", "ولگا"], 0),
+    ("کدام قاره به‌عنوان قاره یخ‌زده شناخته می‌شود؟", ["قطب جنوب", "آفریقا", "آسیا", "اروپا"], 0),
+    ("پایتخت ژاپن کدام شهر است؟", ["توکیو", "اوزاکا", "کیوتو", "ناگویا"], 0),
+    ("کوچک‌ترین قاره جهان کدام است؟", ["استرالیا", "اروپا", "آنتارکتیکا", "آفریقا"], 0),
+    ("رودخانه کارون در کدام کشور جریان دارد؟", ["ایران", "عراق", "ترکیه", "افغانستان"], 0),
+    ("پایتخت ترکیه کدام شهر است؟", ["آنکارا", "استانبول", "ازمیر", "آنتالیا"], 0),
+],
+"sci": [
+    ("فرمول شیمیایی آب چیست؟", ["H2O", "CO2", "O2", "NaCl"], 0),
+    ("سیاره سرخ منظومه شمسی کدام است؟", ["مریخ", "زهره", "مشتری", "عطارد"], 0),
+    ("گاز اصلی تشکیل‌دهنده هوای زمین کدام است؟", ["نیتروژن", "اکسیژن", "دی‌اکسیدکربن", "هیدروژن"], 0),
+    ("واحد اندازه‌گیری نیرو در فیزیک چیست؟", ["نیوتن", "ژول", "وات", "پاسکال"], 0),
+    ("نزدیک‌ترین ستاره به کره زمین کدام است؟", ["خورشید", "پروکسیما قنطورس", "سیریوس", "ستاره قطبی"], 0),
+    ("سرعت تقریبی نور چند کیلومتر بر ثانیه است؟", ["۳۰۰۰۰۰", "۳۰۰۰", "۳۰۰", "۳۰"], 0),
+    ("کدام سیاره حلقه‌های معروف دارد؟", ["زحل", "مریخ", "زمین", "عطارد"], 0),
+    ("کدام فلز در دمای اتاق به حالت مایع است؟", ["جیوه", "آهن", "مس", "آلومینیوم"], 0),
+    ("واحد اندازه‌گیری مقاومت الکتریکی چیست؟", ["اهم", "آمپر", "ولت", "وات"], 0),
+    ("خون انسان بیشتر از چه گروهی از سلول‌ها تشکیل شده؟", ["گلبول قرمز", "گلبول سفید", "پلاکت", "پلاسما"], 0),
+    ("کدام گاز برای تنفس انسان ضروری است؟", ["اکسیژن", "نیتروژن", "هیدروژن", "هلیوم"], 0),
+    ("بزرگ‌ترین سیاره منظومه شمسی کدام است؟", ["مشتری", "زحل", "نپتون", "اورانوس"], 0),
+],
+"hist": [
+    ("بنیان‌گذار سلسله هخامنشی چه کسی بود؟", ["کوروش بزرگ", "داریوش", "خشایارشا", "کمبوجیه"], 0),
+    ("پایتخت مشهور دوره صفوی کدام شهر بود؟", ["اصفهان", "شیراز", "تبریز", "قزوین"], 0),
+    ("جنگ جهانی دوم در چه سالی به پایان رسید؟", ["۱۹۴۵", "۱۹۱۸", "۱۹۳۹", "۱۹۵۰"], 0),
+    ("کتیبه بیستون مربوط به کدام پادشاه است؟", ["داریوش یکم", "کوروش", "اردشیر", "خشایارشا"], 0),
+    ("جنگ جهانی اول در چه سالی پایان یافت؟", ["۱۹۱۸", "۱۹۱۴", "۱۹۳۹", "۱۹۴۵"], 0),
+    ("اهرام ثلاثه در کدام کشور قرار دارند؟", ["مصر", "ایران", "یونان", "هند"], 0),
+    ("سلسله قاجار پس از کدام سلسله روی کار آمد؟", ["زندیه", "صفویه", "افشاریه", "پهلوی"], 0),
+    ("اولین انسان روی ماه چه کسی بود؟", ["نیل آرمسترانگ", "باز آلدرین", "یوری گاگارین", "جان گلن"], 0),
+],
+"sport": [
+    ("جام جهانی فوتبال هر چند سال یک‌بار برگزار می‌شود؟", ["۴ سال", "۲ سال", "۳ سال", "۵ سال"], 0),
+    ("تعداد بازیکنان هر تیم فوتبال روی زمین چند نفر است؟", ["۱۱", "۱۰", "۹", "۱۲"], 0),
+    ("المپیک تابستانی معمولاً هر چند سال یک‌بار است؟", ["۴", "۲", "۳", "۵"], 0),
+    ("برای برد در والیبال معمولی چند ست لازم است؟", ["۳ از ۵", "۲ از ۳", "۴ از ۷", "۱ ست"], 0),
+    ("تعداد بازیکن هر تیم بسکتبال روی زمین چند نفر است؟", ["۵", "۶", "۷", "۴"], 0),
+    ("هر نیمه فوتبال رسمی چند دقیقه است؟", ["۴۵ دقیقه", "۳۰ دقیقه", "۶۰ دقیقه", "۴۰ دقیقه"], 0),
+    ("تعداد بازیکنان تیم والیبال روی زمین چند نفر است؟", ["۶", "۵", "۷", "۹"], 0),
+    ("میزبان اولین جام جهانی فوتبال کدام کشور بود؟", ["اروگوئه", "برزیل", "آرژانتین", "ایتالیا"], 0),
+],
+"fun": [
+    ("کارگردان فیلم جدایی نادر از سیمین کیست؟", ["اصغر فرهادی", "عباس کیارستمی", "داریوش مهرجویی", "ابراهیم حاتمی‌کیا"], 0),
+    ("شخصیت زرد رنگ خانواده سیمپسون‌ها کیست؟", ["هومر", "بارت", "لیزا", "مارج"], 0),
+    ("کدام شبکه اجتماعی قبلاً با نماد پرنده شناخته می‌شد؟", ["توییتر", "اینستاگرام", "تلگرام", "واتساپ"], 0),
+    ("نویسنده کتاب شازده کوچولو کیست؟", ["آنتوان دو سنت‌اگزوپری", "ویکتور هوگو", "مولیر", "آلبر کامو"], 0),
+    ("رنگ اصلی شخصیت باب‌اسفنجی چیست؟", ["زرد", "آبی", "قرمز", "سبز"], 0),
+    ("نویسنده مجموعه هری پاتر کیست؟", ["جی‌کی رولینگ", "تالکین", "سی‌اس لوئیس", "چارلز دیکنز"], 0),
+    ("کدام انیمیشن درباره اسباب‌بازی‌های زنده است؟", ["داستان اسباب‌بازی", "یخ‌زده", "موانا", "زوتوپیا"], 0),
+    ("شخصیت گربه تنبل در گارفیلد چه رنگی است؟", ["نارنجی", "مشکی", "خاکستری", "سفید"], 0),
+],
+"gen": [
+    ("سال عادی چند روز دارد؟", ["۳۶۵", "۳۶۴", "۳۶۰", "۳۶۶"], 0),
+    ("کدام رنگ در پرچم رسمی ایران وجود ندارد؟", ["آبی", "قرمز", "سفید", "سبز"], 0),
+    ("زبان رسمی کشور ایران چیست؟", ["فارسی", "عربی", "ترکی", "کردی"], 0),
+    ("هر هفته چند روز است؟", ["۷", "۶", "۵", "۸"], 0),
+    ("مقیاس رایج اندازه‌گیری دما در ایران چیست؟", ["سانتی‌گراد", "فارنهایت", "کلوین", "رانکین"], 0),
+    ("پایتخت کشور آلمان کدام شهر است؟", ["برلین", "مونیخ", "هامبورگ", "فرانکفورت"], 0),
+    ("تعداد ماه‌های سال چندتاست؟", ["۱۲", "۱۰", "۱۱", "۱۳"], 0),
+    ("واحد پول رسمی ایران چیست؟", ["ریال", "تومان", "دینار", "افغانی"], 0),
+]}
+
+WORDS = [
+    "کتاب","مدرسه","ایران","دانش","خورشید","دوست","آسمان","بهار","ربات","خبر",
+    "امید","پیروزی","قهرمان","آینده","ستارگان","دانشمند","خبرنگار","آزادی","مسابقه","امتیاز",
+    "دریای","کوهستان","گلستان","پایتخت","فرهنگ","تاریخ","ورزش","فوتبال","قهرمانی","مدال",
+    "کامیابی","پشتکار","تلاش","موفقیت","خلاقیت","ایده","نوآوری","فناوری","هوشمند","رایانه",
+    "تلفن","پیام","کانال","عضویت","پشتیبانی","مدیریت","کاربر","پروفایل","دعوت","جایزه",
+    "چالش","گزارش","خلاصه","فوری","بروزرسانی","منبع","اقتصاد","سیاست","سلامت","آموزش",
+    "هنر","موسیقی","سینما","کتابخانه","دانشگاه","معلم","دانشجو","پژوهش","کشف","اختراع"
+]
+# بخش ۳/۴ — نمایش، منو، پیام‌ها
+
+def scramble(w):
+    a = list(w)
+    for _ in range(25):
+        random.shuffle(a)
+        s = "".join(a)
+        if s != w: return s
+    return w[::-1]
+
+def greet():
+    h = datetime.now().hour
+    if h < 12: return "صبح بخیر"
+    if h < 18: return "ظهر بخیر"
+    return "عصر بخیر"
+
+def gate(cid):
+    chs = get_channels()
+    lines = "\n".join(f"• {t}" for _, t in chs) if chs else "• هنوز کانالی تعریف نشده"
+    send(cid,
+         "🔒 برای استفاده از ربات لازم است ابتدا در کانال‌های زیر عضو شوید:\n\n"
+         f"{lines}\n\n"
+         "پس از عضویت، روی دکمه «بررسی عضویت» بزنید.\n"
+         "اگر از کانالی خارج شوید، دسترسی دوباره محدود می‌شود.",
+         join_kb())
+
+def main_menu(cid, name="", uid=None):
+    u = user(uid) if uid else None
+    p = u["points"] if u else 0
+    title = (u.get("title") or "").strip() if u else ""
+    tline = f"\n🏷 عنوان شما: {title}" if title else ""
+    send(cid,
+         f"👋 {greet()}{(' ' + name) if name else ''}!{tline}\n\n"
+         f"به ربات Part News خوش آمدید.\n"
+         f"{level_of(p)} | ⭐ امتیاز فعلی: {p}\n\n"
+         "از منوی زیر بخش مورد نظرتان را انتخاب کنید.\n"
+         "اخبار مهم، مسابقه، جایزه، دعوت دوستان و امکانات دیگر در دسترس شماست.",
+         main_kb())
+
+def one_news(kind):
+    c = db()
+    r = c.execute(
+        "SELECT * FROM news WHERE kind=? AND is_published=1 ORDER BY score DESC, id DESC LIMIT 1",
+        (kind,)).fetchone()
+    c.close()
+    return dict(r) if r else None
+
+def format_urgent():
+    x = one_news("urgent")
+    if not x:
+        return ("🚨 خبر فوری\n\n"
+                "در حال حاضر خبر فوری مهمی ثبت نشده است.\n"
+                "می‌توانید از دکمه بروزرسانی اخبار استفاده کنید.")
+    t = f"🚨 خبر فوری و مهم\n━━━━━━━━━━━━━━\n\n{x['title']}"
+    b = (x.get("body") or "").strip()
+    if b and b != x["title"]:
+        t += f"\n\n{b[:400]}"
+    t += f"\n\n━━━━━━━━━━━━━━\nمنابع: {x.get('source') or 'خبرگزاری‌های داخلی'}\nساعت انتشار در ربات: {datetime.now():%H:%M}"
+    return t
+
+def format_day():
+    x = one_news("day")
+    if not x:
+        return ("🗞 خبر روز\n\n"
+                "هنوز خبر مهمی برای نمایش به‌عنوان خبر روز ذخیره نشده است.\n"
+                "لطفاً کمی بعد دوباره تلاش کنید یا بروزرسانی را بزنید.")
+    t = f"🗞 مهم‌ترین خبر روز\n━━━━━━━━━━━━━━\n\n{x['title']}"
+    b = (x.get("body") or "").strip()
+    if b and b != x["title"]:
+        t += f"\n\n{b[:450]}"
+    t += f"\n\n━━━━━━━━━━━━━━\nمنابع: {x.get('source') or 'خبرگزاری‌های داخلی'}\nتاریخ: {datetime.now():%Y/%m/%d}"
+    return t
+
+def format_summary():
+    c = db()
+    r = c.execute("SELECT body FROM news WHERE kind='summary' AND is_published=1 ORDER BY id DESC LIMIT 1").fetchone()
+    c.close()
+    if r and r["body"]:
+        return (f"📰 خلاصه اخبار مهم\n📅 {datetime.now():%Y/%m/%d}\n\n"
+                f"{r['body']}\n\nشناسه ربات: @{BOT_USERNAME}")
+    return ("📰 خلاصه اخبار\n\n"
+            "خلاصه هنوز آماده نشده است.\n"
+            "لطفاً دکمه بروزرسانی اخبار را بزنید تا آخرین عناوین مهم دریافت شود.")
+
+def morning_report(uid):
+    u = user(uid) or {}
+    return (
+        f"☀️ گزارش اختصاصی شما\n━━━━━━━━━━━━━━\n\n"
+        f"👤 نام: {u.get('first_name') or 'کاربر'}\n"
+        f"⭐ امتیاز: {u.get('points', 0)}\n"
+        f"سطح: {level_of(u.get('points', 0))}\n"
+        f"🔥 استریک جایزه روزانه: {u.get('streak', 0)} روز\n"
+        f"🎯 کمبوی فعلی مسابقه: {u.get('quiz_combo', 0)}\n"
+        f"🏅 بهترین کمبو: {u.get('best_combo', 0)}\n\n"
+        f"{format_summary()}"
+    )
+
+def today_challenge():
+    day = datetime.now().strftime("%Y-%m-%d")
+    c = db()
+    row = c.execute("SELECT * FROM challenge WHERE day=?", (day,)).fetchone()
+    if row:
+        c.close(); return dict(row)
+    cat = random.choice(list(QUIZ.keys()))
+    qs = QUIZ[cat]
+    qi = random.randrange(len(qs))
+    q = qs[qi][0]
+    c.execute("INSERT OR REPLACE INTO challenge(day,cat,qindex,text) VALUES(?,?,?,?)",
+              (day, cat, qi, q))
+    c.commit(); c.close()
+    return {"day": day, "cat": cat, "qindex": qi, "text": q}
+
+def top5():
+    c = db()
+    rows = c.execute("SELECT first_name,points,title FROM users WHERE banned=0 ORDER BY points DESC LIMIT 5").fetchall()
+    c.close()
+    if not rows:
+        return "🏆 جدول برترین‌ها\n\nهنوز کسی امتیاز قابل‌توجهی کسب نکرده است. اولین نفر شما باشید!"
+    lines = ["🏆 جدول برترین کاربران\n━━━━━━━━━━━━━━"]
+    medals = ["🥇", "🥈", "🥉", "4️⃣", "5️⃣"]
+    for i, r in enumerate(rows):
+        t = f" | {r['title']}" if r["title"] else ""
+        lines.append(f"{medals[i]} {r['first_name'] or 'کاربر'}{t}\n   ⭐ {r['points']} امتیاز")
+    lines.append("\nبا مسابقه، دعوت و جایزه روزانه می‌توانید رتبه خود را بالا ببرید.")
+    return "\n".join(lines)
+
+def show_ach(uid):
+    c = db()
+    rows = c.execute("SELECT code,unlocked_at FROM achievements WHERE user_id=?", (uid,)).fetchall()
+    c.close()
+    names = {
+        "first_quiz": "🧠 اولین پاسخ درست مسابقه",
+        "quiz10": "🎯 ده پاسخ درست",
+        "combo5": "🔥 کمبوی پنج‌تایی",
+        "streak3": "📅 استریک سه روزه جایزه",
+        "rich": "💰 رسیدن به صد امتیاز",
+        "lucky": "🎲 اولین جعبه شانس",
+        "chal": "🎯 پیروزی در چالش روز",
+    }
+    if not rows:
+        return ("🏅 دستاوردها\n\n"
+                "هنوز دستاوردی باز نکرده‌اید.\n"
+                "با شرکت در مسابقه، گرفتن جایزه روزانه، دعوت دوستان و چالش روز "
+                "می‌توانید دستاورد بگیرید و امتیاز هدیه دریافت کنید.")
+    lines = ["🏅 دستاوردهای شما\n━━━━━━━━━━━━━━"]
+    for r in rows:
+        lines.append(f"• {names.get(r['code'], r['code'])}\n  تاریخ: {r['unlocked_at'][:10]}")
+    return "\n".join(lines)
+
+def help_text():
+    return (
+        "💡 راهنمای کامل ربات\n━━━━━━━━━━━━━━\n\n"
+        "📰 اخبار\n"
+        "خلاصه مهم‌ترین عناوین، خبر روز و خبر فوری از چند خبرگزاری معتبر. "
+        "خبرهای کم‌اهمیت فیلتر می‌شوند.\n\n"
+        "🧠 مسابقه\n"
+        "سؤالات چندگزینه‌ای در موضوعات مختلف. پاسخ درست امتیاز می‌دهد. "
+        "پاسخ‌های پشت‌سرهم صحیح، کمبو و امتیاز بیشتری می‌سازد.\n\n"
+        "🎯 چالش روز\n"
+        "هر روز یک سؤال مشترک برای همه کاربران. فقط یک‌بار در روز قابل پاسخ است.\n\n"
+        "☀️ گزارش من\n"
+        "خلاصه وضعیت امتیاز، سطح، استریک و آخرین اخبار مهم.\n\n"
+        "🎁 جایزه روزانه و 🎲 جعبه شانس\n"
+        "هر ۲۴ ساعت یک‌بار قابل دریافت هستند.\n\n"
+        "🔤 کلمه\n"
+        "حروف به‌هم‌ریخته را مرتب کنید و امتیاز بگیرید.\n\n"
+        "🛒 فروشگاه\n"
+        "با امتیاز، عنوان نمایشی برای پروفایل بخرید.\n\n"
+        "👥 دعوت دوستان\n"
+        "با لینک اختصاصی دوستانتان را دعوت کنید و امتیاز بگیرید.\n\n"
+        "عضویت در کانال‌های اعلام‌شده برای استفاده از ربات الزامی است.\n"
+        "برای لغو عملیات در حال انجام از دستور /cancel استفاده کنید.\n"
+        "پشتیبانی از طریق دکمه مربوطه در منو در دسترس است."
+    )
+# بخش ۴ـالف
+
+def on_msg(m):
+    cid = m["chat"]["id"]
+    fr = m.get("from") or {}
+    uid = fr.get("id")
+    name = fr.get("first_name") or ""
+    uname = fr.get("username") or ""
+    text = (m.get("text") or "").strip()
+    if not uid: return
+    st = state.get(uid) or {}
+
+    if text == "/cancel":
+        state.pop(uid, None)
+        send(cid, "عملیات لغو شد. می‌توانید از منو ادامه دهید.", main_kb())
+        return
+
+    if text.startswith("/start"):
+        state.pop(uid, None)
+        ref = None
+        p = text.split(maxsplit=1)
+        if len(p) > 1 and p[1].startswith("ref_"):
+            try: ref = int(p[1].replace("ref_", ""))
+            except Exception: pass
+        is_new = ensure(uid, name, uname, ref)
+        if is_banned(uid):
+            send(cid, "دسترسی شما به ربات محدود شده است. در صورت اعتراض به پشتیبانی پیام دهید.")
+            return
+        ad = get_setting("start_ad", "").strip()
+        if ad:
+            send(cid, ad)
+        if missing_ch(uid):
+            gate(cid)
+        else:
+            if is_new:
+                send(cid,
+                     f"🎁 به جمع ما خوش آمدید!\n\n"
+                     f"به‌عنوان هدیه ورود، {WELCOME_BONUS} امتیاز به حساب شما اضافه شد.\n"
+                     f"از منوی زیر می‌توانید استفاده از ربات را شروع کنید.")
+            main_menu(cid, name, uid)
+        return
+
+    ensure(uid, name, uname)
+    if is_banned(uid):
+        send(cid, "دسترسی شما محدود شده است.")
+        return
+    if uid != ADMIN_ID and missing_ch(uid):
+        gate(cid); return
+    if not spam_ok(uid):
+        return
+
+    if text == "/admin" and uid == ADMIN_ID:
+        send(cid,
+             "⚙️ پنل مدیریت\n\n"
+             "از دکمه‌های زیر برای مدیریت کامل ربات استفاده کنید:\n"
+             "آمار، پیام همگانی، اخبار، تبلیغ استارت، قفل عضویت، امتیاز، مسدودسازی و پشتیبانی.",
+             adm_kb())
+        return
+
+    if uid == ADMIN_ID and st.get("m") == "ad_set":
+        set_setting("start_ad", text)
+        state.pop(uid, None)
+        send(cid, "✅ تبلیغ استارت ذخیره شد.\nاز این پس قبل از ورود کاربر، این متن نمایش داده می‌شود.", adm_kb())
+        return
+    if uid == ADMIN_ID and st.get("m") == "ch_add":
+        if "|" not in text:
+            send(cid, "فرمت درست نیست.\nمثال:\npartnews | 📢 کانال اخبار")
+            return
+        un, title = [x.strip() for x in text.split("|", 1)]
+        un = un.lstrip("@")
+        c = db()
+        c.execute("INSERT OR REPLACE INTO channels(username,title) VALUES(?,?)", (un, title or f"@{un}"))
+        c.commit(); c.close()
+        state.pop(uid, None)
+        send(cid, f"✅ کانال @{un} به قفل عضویت اضافه شد.", adm_kb())
+        return
+    if uid == ADMIN_ID and st.get("m") == "ch_del":
+        un = text.strip().lstrip("@")
+        c = db()
+        c.execute("DELETE FROM channels WHERE username=?", (un,))
+        c.commit(); c.close()
+        state.pop(uid, None)
+        send(cid, f"✅ اگر کانال @{un} وجود داشت حذف شد.", adm_kb())
+        return
+    if uid == ADMIN_ID and st.get("m") == "give":
+        parts = text.split()
+        if len(parts) < 2:
+            send(cid, "فرمت: آیدی_عددی مقدار_امتیاز\nمثال:\n123456 20")
+            return
+        try:
+            tid, amount = int(parts[0]), int(parts[1])
+            pts(tid, amount)
+            state.pop(uid, None)
+            send(cid, f"✅ {amount} امتیاز به کاربر {tid} اضافه شد.")
+            try: send(tid, f"⭐ مدیریت برای شما {amount} امتیاز واریز کرد.\nموجودی: {pts(tid)}")
+            except Exception: pass
+        except Exception:
+            send(cid, "فرمت نامعتبر است.")
+        return
+    if uid == ADMIN_ID and st.get("m") == "ban":
+        try:
+            tid = int(text.strip())
+            c = db(); c.execute("UPDATE users SET banned=1 WHERE user_id=?", (tid,)); c.commit(); c.close()
+            state.pop(uid, None)
+            send(cid, f"🚫 کاربر {tid} مسدود شد.", adm_kb())
+        except Exception:
+            send(cid, "آیدی عددی معتبر بفرستید.")
+        return
+    if uid == ADMIN_ID and st.get("m") == "unban":
+        try:
+            tid = int(text.strip())
+            c = db(); c.execute("UPDATE users SET banned=0 WHERE user_id=?", (tid,)); c.commit(); c.close()
+            state.pop(uid, None)
+            send(cid, f"✅ مسدودی کاربر {tid} برداشته شد.", adm_kb())
+        except Exception:
+            send(cid, "آیدی عددی معتبر بفرستید.")
+        return
+    if uid == ADMIN_ID and st.get("m") == "news":
+        lines = text.split("\n", 1)
+        title = lines[0][:200]
+        body = lines[1] if len(lines) > 1 else ""
+        sc = max(news_score(title, body), 10)
+        c = db()
+        c.execute(
+            "INSERT INTO news(kind,title,body,source,score,is_published,created_at) VALUES(?,?,?,?,?,1,?)",
+            (st.get("k", "day"), title, body, "مدیریت", sc, datetime.now().strftime("%Y-%m-%d %H:%M:%S")))
+        c.commit(); c.close()
+        state.pop(uid, None)
+        send(cid, "✅ خبر با موفقیت ثبت و منتشر شد.", adm_kb())
+        return
+    if uid == ADMIN_ID and st.get("m") == "bc":
+        state.pop(uid, None)
+        send(cid, "⏳ ارسال پیام همگانی شروع شد. لطفاً صبر کنید...")
+        c = db(); rows = c.execute("SELECT user_id FROM users WHERE banned=0").fetchall(); c.close()
+        ok = fail = 0
+        for r in rows:
+            if send(r["user_id"], f"📢 پیام مدیریت\n\n{text}").get("ok"): ok += 1
+            else: fail += 1
+            time.sleep(0.04)
+        send(cid, f"ارسال تمام شد.\n✅ موفق: {ok}\n❌ ناموفق: {fail}", adm_kb())
+        return
+    if uid == ADMIN_ID and text.startswith("/reply_"):
+        try:
+            state[uid] = {"m": "reply", "t": int(text.split("_", 1)[1].split()[0])}
+            send(cid, "متن پاسخ به کاربر را کامل بنویسید و ارسال کنید.")
+        except Exception:
+            send(cid, "فرمت صحیح: /reply_آیدی‌عددی")
+        return
+    if uid == ADMIN_ID and st.get("m") == "reply":
+        send(st["t"], f"👨‍💻 پاسخ پشتیبانی:\n\n{text}")
+        state.pop(uid, None)
+        send(cid, "✅ پاسخ برای کاربر ارسال شد.", adm_kb())
+        return
+
+    if st.get("m") == "support":
+        c = db()
+        c.execute("INSERT INTO support(user_id,message,created_at,answered) VALUES(?,?,?,0)",
+                  (uid, text[:2000], datetime.now().strftime("%Y-%m-%d %H:%M:%S")))
+        c.commit(); c.close()
+        state.pop(uid, None)
+        send(cid,
+             "✅ پیام شما با موفقیت ثبت شد.\n"
+             "تیم پشتیبانی در اولین فرصت آن را بررسی می‌کند.\n"
+             "از صبوری شما سپاسگزاریم.", main_kb())
+        send(ADMIN_ID,
+             f"📩 پیام پشتیبانی جدید\n\nاز: {name}\nآیدی: {uid}\n\n{text}\n\n"
+             f"برای پاسخ بنویسید:\n/reply_{uid}")
+        return
+
+    if st.get("m") == "word":
+        c = db()
+        row = c.execute("SELECT word FROM word_state WHERE user_id=?", (uid,)).fetchone()
+        c.close()
+        state.pop(uid, None)
+        if row and text.strip() == row["word"]:
+            pts(uid, QUIZ_REWARD)
+            send(cid,
+                 f"🎉 آفرین! درست پیدا کردید.\n\n"
+                 f"کلمه صحیح: {row['word']}\n"
+                 f"⭐ +{QUIZ_REWARD} امتیاز\n"
+                 f"موجودی فعلی: {pts(uid)}", main_kb())
+        else:
+            send(cid,
+                 f"❌ این بار درست نبود.\n\n"
+                 f"جواب صحیح: {row['word'] if row else 'نامشخص'}\n"
+                 f"امتیازی کم نشد. دوباره تلاش کنید.", main_kb())
+        return
+
+    if st.get("m") == "chal":
+        ch = today_challenge()
+        q, opts, correct = QUIZ[ch["cat"]][ch["qindex"]]
+        state.pop(uid, None)
+        if text.strip() == opts[correct]:
+            pts(uid, 6)
+            grant_ach(uid, "chal", "🎯 پیروزی در چالش روز")
+            c = db()
+            c.execute("UPDATE users SET last_challenge=? WHERE user_id=?", (ch["day"], uid))
+            c.commit(); c.close()
+            send(cid,
+                 f"✅ پاسخ چالش امروز درست بود!\n\n"
+                 f"⭐ ۶ امتیاز به حساب شما اضافه شد.\n"
+                 f"موجودی: {pts(uid)}\n\nفردا دوباره چالش جدید منتظرتان است.", main_kb())
+        else:
+            send(cid,
+                 f"❌ پاسخ چالش نادرست بود.\n\n"
+                 f"جواب صحیح: {opts[correct]}\n"
+                 f"امتیازی کم نشد. فردا دوباره شانس دارید.", main_kb())
+        return
+
+    if text == "📰 اخبار":
+        send(cid,
+             "📰 بخش اخبار\n\n"
+             "در این بخش فقط رویدادهای مهم از چند خبرگزاری جمع‌آوری و نمایش داده می‌شود.\n\n"
+             "• خلاصه: چند عنوان کلیدی روز\n"
+             "• خبر روز: یک خبر مهم\n"
+             "• خبر فوری: داغ‌ترین عنوان لحظه‌ای\n\n"
+             "یک گزینه را انتخاب کنید:", news_kb())
+    elif text == "🧠 مسابقه":
+        send(cid,
+             "🧠 مسابقه اطلاعات عمومی\n\n"
+             "یک موضوع انتخاب کنید و به سؤالات پاسخ دهید.\n"
+             "✅ پاسخ درست: حداقل ۲ امتیاز\n"
+             "پاسخ‌های پشت‌سرهم صحیح، کمبو و امتیاز بیشتری می‌سازد.\n"
+             "❌ پاسخ نادرست: بدون کسر امتیاز\n\n"
+             "موضوع مورد علاقه خود را انتخاب کنید:", quiz_kb())
+    elif text == "🎯 چالش روز":
+        u = user(uid)
+        day = datetime.now().strftime("%Y-%m-%d")
+        if u and u.get("last_challenge") == day:
+            send(cid,
+                 "🎯 چالش روز\n\n"
+                 "شما امروز در چالش شرکت کرده‌اید.\n"
+                 "فردا دوباره می‌توانید در چالش جدید شرکت کنید.")
+            return
+        ch = today_challenge()
+        state[uid] = {"m": "chal"}
+        send(cid,
+             f"🎯 چالش امروز\n━━━━━━━━━━━━━━\n\n"
+             f"{ch['text']}\n\n"
+             f"پاسخ را به‌صورت متن کامل و دقیق ارسال کنید.\n"
+             f"برای انصراف: /cancel")
+    elif text == "☀️ گزارش من":
+        send(cid, morning_report(uid))
+    elif text == "🎁 جایزه روزانه":
+        u = user(uid)
+        last = u.get("last_daily") if u else None
+        now = datetime.now()
+        streak = (u.get("streak") or 0) if u else 0
+        if last:
+            try:
+                ld = datetime.strptime(last, "%Y-%m-%d %H:%M:%S")
+                if now - ld < timedelta(hours=24):
+                    r = timedelta(hours=24) - (now - ld)
+                    h, m = divmod(int(r.total_seconds()), 3600)
+                    send(cid,
+                         f"🎁 جایزه روزانه\n\n"
+                         f"هنوز ۲۴ ساعت از دریافت قبلی نگذشته است.\n"
+                         f"⏳ زمان باقی‌مانده: {h} ساعت و {m // 60} دقیقه\n"
+                         f"🔥 استریک فعلی شما: {streak} روز\n\n"
+                         f"بعداً دوباره سر بزنید.")
+                    return
+                streak = streak + 1 if now - ld < timedelta(hours=48) else 1
+            except Exception:
+                streak = 1
+        else:
+            streak = 1
+        bonus = min(streak, 7)
+        gain = DAILY_REWARD + bonus
+        pts(uid, gain)
+        c = db()
+        c.execute("UPDATE users SET last_daily=?,streak=? WHERE user_id=?",
+                  (now.strftime("%Y-%m-%d %H:%M:%S"), streak, uid))
+        c.commit(); c.close()
+        if streak >= 3:
+            grant_ach(uid, "streak3", "📅 استریک سه روزه جایزه")
+        send(cid,
+             f"🎁 جایزه روزانه دریافت شد!\n━━━━━━━━━━━━━━\n\n"
+             f"⭐ مجموع دریافتی: {gain} امتیاز\n"
+             f"(پایه {DAILY_REWARD} + پاداش استریک {bonus})\n"
+             f"🔥 استریک: {streak} روز متوالی\n"
+             f"⭐ موجودی فعلی: {pts(uid)}\n"
+             f"{level_of(pts(uid))}\n\n"
+             f"فردا همین ساعت دوباره منتظرتان هستیم.")
+    elif text == "🎲 جعبه شانس":
+        u = user(uid)
+        last = u.get("last_lucky") if u else None
+        now = datetime.now()
+        if last:
+            try:
+                ld = datetime.strptime(last, "%Y-%m-%d %H:%M:%S")
+                if now - ld < timedelta(hours=24):
+                    r = timedelta(hours=24) - (now - ld)
+                    h, m = divmod(int(r.total_seconds()), 3600)
+                    send(cid,
+                         f"🎲 جعبه شانس\n\n"
+                         f"امروز جعبه را باز کرده‌اید.\n"
+                         f"⏳ زمان باقی‌مانده تا جعبه بعدی: {h} ساعت و {m // 60} دقیقه")
+                    return
+            except Exception:
+                pass
+        gain = random.randint(1, 15)
+        pts(uid, gain)
+        c = db()
+        c.execute("UPDATE users SET last_lucky=? WHERE user_id=?",
+                  (now.strftime("%Y-%m-%d %H:%M:%S"), uid))
+        c.commit(); c.close()
+        grant_ach(uid, "lucky", "🎲 اولین جعبه شانس")
+        send(cid,
+             f"🎲 جعبه شانس باز شد!\n━━━━━━━━━━━━━━\n\n"
+             f"⭐ شما {gain} امتیاز برنده شدید.\n"
+             f"موجودی فعلی: {pts(uid)}\n\n"
+             f"فردا دوباره می‌توانید شانس خود را امتحان کنید.")
+    elif text == "🔤 کلمه":
+        w = random.choice(WORDS)
+        sc = scramble(w)
+        c = db()
+        c.execute("INSERT OR REPLACE INTO word_state(user_id,word) VALUES(?,?)", (uid, w))
+        c.commit(); c.close()
+        state[uid] = {"m": "word"}
+        send(cid,
+             f"🔤 بازی کلمه به‌هم‌ریخته\n━━━━━━━━━━━━━━\n\n"
+             f"حروف زیر را مرتب کنید و کلمه درست را بفرستید:\n\n"
+             f"« {sc} »\n\n"
+             f"اگر درست بگویید {QUIZ_REWARD} امتیاز می‌گیرید.\n"
+             f"برای انصراف: /cancel")
+    elif text == "🛒 فروشگاه":
+        send(cid,
+             "🛒 فروشگاه عنوان پروفایل\n\n"
+             "با خرج کردن امتیاز می‌توانید یک عنوان نمایشی بخرید.\n"
+             "این عنوان در پروفایل و جدول برترین‌ها کنار نام شما دیده می‌شود.\n\n"
+             "یک مورد را انتخاب کنید:", shop_kb())
+    elif text in ("👥 دعوت دوستان", "👥 دعوت"):
+        u = user(uid)
+        link = f"https://ble.ir/{BOT_USERNAME}?start=ref_{uid}"
+        send(cid,
+             f"👥 دعوت از دوستان\n━━━━━━━━━━━━━━\n\n"
+             f"با دعوت دوستان هم آن‌ها می‌توانند از ربات استفاده کنند و هم شما امتیاز می‌گیرید.\n\n"
+             f"⭐ پاداش هر دعوت موفق: {REF_REWARD} امتیاز\n\n"
+             f"🔗 لینک اختصاصی شما:\n{link}\n\n"
+             f"این لینک را برای دوستان خود بفرستید.\n"
+             f"📊 تعداد دعوت‌های موفق تا الان: {u.get('referral_count', 0) if u else 0}\n"
+             f"⭐ امتیاز فعلی شما: {pts(uid)}")
+    elif text in ("⭐ پروفایل", "⭐ امتیاز من"):
+        u = user(uid) or {}
+        p = u.get("points", 0)
+        left, nxt = next_level(p)
+        ok, allq = u.get("quiz_ok", 0), u.get("quiz_all", 0)
+        acc = f"{int(100 * ok / allq)}٪" if allq else "هنوز بازی نکرده‌اید"
+        extra = f"تا سطح بعد ({nxt}): {left} امتیاز باقی مانده است." if left else "شما به بالاترین سطح تعریف‌شده رسیده‌اید."
+        send(cid,
+             f"⭐ پروفایل شما\n━━━━━━━━━━━━━━\n\n"
+             f"👤 نام: {u.get('first_name') or name}\n"
+             f"🏷 عنوان: {u.get('title') or 'بدون عنوان'}\n"
+             f"{level_of(p)}\n"
+             f"⭐ امتیاز: {p}\n"
+             f"🔥 استریک جایزه روزانه: {u.get('streak', 0)} روز\n"
+             f"🧠 پاسخ درست مسابقه: {ok} از {allq} ({acc})\n"
+             f"🎯 کمبوی فعلی: {u.get('quiz_combo', 0)} | بهترین کمبو: {u.get('best_combo', 0)}\n"
+             f"👥 دعوت‌های موفق: {u.get('referral_count', 0)}\n"
+             f"📅 تاریخ عضویت: {u.get('joined_at') or '—'}\n\n{extra}")
+    elif text == "🏆 برترین‌ها":
+        send(cid, top5())
+    elif text == "🏅 دستاوردها":
+        send(cid, show_ach(uid))
+    elif text == "💡 راهنما":
+        send(cid, help_text())
+    elif text == "👨‍💻 پشتیبانی":
+        state[uid] = {"m": "support"}
+        send(cid,
+             "👨‍💻 پشتیبانی\n\n"
+             "پیام، انتقاد یا پیشنهاد خود را کامل بنویسید و ارسال کنید.\n"
+             "پیام شما به مدیریت می‌رسد و در صورت نیاز پاسخ داده می‌شود.\n\n"
+             "برای انصراف از دستور /cancel استفاده کنید.")
+    else:
+        send(cid,
+             "لطفاً از دکمه‌های منوی پایین استفاده کنید.\n"
+             "اگر منو را نمی‌بینید، دستور /start را بزنید.", main_kb())
+# بخش ۴ـب
+
+def ask_q(cid, uid):
+    c = db()
+    st = c.execute("SELECT * FROM quiz_state WHERE user_id=?", (uid,)).fetchone()
+    c.close()
+    if not st:
+        send(cid, "لطفاً یک موضوع مسابقه انتخاب کنید:", quiz_kb()); return
+    cat, idx = st["category"], st["qindex"]
+    if cat == "mix" or (isinstance(cat, str) and str(cat).startswith("mix")):
+        all_q = []
+        for k, qs in QUIZ.items():
+            for i, item in enumerate(qs):
+                all_q.append((k, i, item))
+        if idx >= 10:
+            send(cid, "این دور مسابقه ترکیبی به پایان رسید.\nمی‌توانید موضوع دیگری انتخاب کنید.", quiz_kb())
+            return
+        pick = random.choice(all_q)
+        qcat, qidx, (q, opts, correct) = pick
+        order = list(range(len(opts)))
+        random.shuffle(order)
+        shuffled = [opts[i] for i in order]
+        correct_pos = order.index(correct)
+        c = db()
+        c.execute("UPDATE quiz_state SET correct_pos=?, category=? WHERE user_id=?",
+                  (correct_pos, f"mix:{qcat}:{qidx}", uid))
+        c.commit(); c.close()
+        rows = [[{"text": shuffled[i], "callback_data": f"qa:mix:{idx}:{i}"}] for i in range(len(shuffled))]
+        rows.append([{"text": "🔙 بازگشت به منو", "callback_data": "back"}])
+        send(cid, f"🎲 مسابقه ترکیبی — سؤال {idx + 1} از ۱۰\n\n{q}", {"inline_keyboard": rows})
+        return
+    qs = QUIZ.get(cat) or []
+    if idx >= len(qs):
+        send(cid, "سؤالات این موضوع تمام شد.\nموضوع دیگری را انتخاب کنید یا بعداً برگردید.", quiz_kb())
+        return
+    q, opts, correct = qs[idx]
+    order = list(range(len(opts)))
+    random.shuffle(order)
+    shuffled = [opts[i] for i in order]
+    correct_pos = order.index(correct)
+    c = db()
+    c.execute("UPDATE quiz_state SET correct_pos=? WHERE user_id=?", (correct_pos, uid))
+    c.commit(); c.close()
+    rows = [[{"text": shuffled[i], "callback_data": f"qa:{cat}:{idx}:{i}"}] for i in range(len(shuffled))]
+    rows.append([{"text": "🔙 بازگشت به منو", "callback_data": "back"}])
+    send(cid, f"🧠 سؤال {idx + 1} از {len(qs)}\n\n{q}", {"inline_keyboard": rows})
+
+def on_cb(cb):
+    global last_news_fetch
+    data = cb.get("data") or ""
+    ans(cb.get("id"))
+    msg = cb.get("message") or {}
+    cid = msg.get("chat", {}).get("id")
+    fr = cb.get("from") or {}
+    uid = fr.get("id")
+    name = fr.get("first_name") or ""
+    if not uid or not cid: return
+    ensure(uid, name, fr.get("username") or "")
+    if is_banned(uid):
+        send(cid, "دسترسی شما محدود شده است."); return
+
+    if data == "check_join":
+        miss = missing_ch(uid)
+        if miss:
+            send(cid,
+                 "❌ هنوز در کانال‌های زیر عضو نیستید:\n\n" +
+                 "\n".join(f"• {t}" for _, t in miss) +
+                 "\n\nلطفاً عضو شوید و دوباره بررسی عضویت را بزنید.", join_kb())
+        else:
+            main_menu(cid, name, uid)
+        return
+
+    if uid != ADMIN_ID and missing_ch(uid):
+        gate(cid); return
+
+    if data == "back":
+        main_menu(cid, name, uid)
+    elif data == "n_sum":
+        send(cid, format_summary())
+    elif data == "n_day":
+        send(cid, format_day())
+    elif data == "n_urg":
+        send(cid, format_urgent())
+    elif data == "n_refresh":
+        last_news_fetch = 0
+        fetch_rss_news()
+        send(cid, "🔄 دریافت و بروزرسانی اخبار انجام شد.", news_kb())
+    elif data == "q_mix":
+        c = db()
+        c.execute("INSERT OR REPLACE INTO quiz_state(user_id,category,qindex,correct_pos) VALUES(?,?,0,0)",
+                  (uid, "mix"))
+        c.commit(); c.close()
+        ask_q(cid, uid)
+    elif data.startswith("q_"):
+        cat = data[2:]
+        if cat in QUIZ:
+            c = db()
+            c.execute("INSERT OR REPLACE INTO quiz_state(user_id,category,qindex,correct_pos) VALUES(?,?,0,0)",
+                      (uid, cat))
+            c.commit(); c.close()
+            ask_q(cid, uid)
+    elif data.startswith("qa:"):
+        try:
+            _, cat, idx, ch = data.split(":")
+            idx, ch = int(idx), int(ch)
+            c = db()
+            st = c.execute("SELECT correct_pos,category FROM quiz_state WHERE user_id=?", (uid,)).fetchone()
+            c.execute("UPDATE users SET quiz_all=quiz_all+1 WHERE user_id=?", (uid,))
+            ok = st and ch == st["correct_pos"]
+            if ok:
+                c.execute("UPDATE users SET quiz_ok=quiz_ok+1, quiz_combo=quiz_combo+1 WHERE user_id=?", (uid,))
+                u = c.execute("SELECT quiz_combo,best_combo,quiz_ok,points FROM users WHERE user_id=?", (uid,)).fetchone()
+                combo = u["quiz_combo"] or 1
+                if combo > (u["best_combo"] or 0):
+                    c.execute("UPDATE users SET best_combo=? WHERE user_id=?", (combo, uid))
+                bonus = min(combo - 1, 5)
+                gain = QUIZ_REWARD + bonus
+                c.execute("UPDATE users SET points=points+? WHERE user_id=?", (gain, uid))
+                c.execute("UPDATE quiz_state SET qindex=qindex+1 WHERE user_id=?", (uid,))
+                c.commit(); c.close()
+                msg_ok = f"✅ پاسخ شما درست بود!\n⭐ +{gain} امتیاز"
+                if bonus:
+                    msg_ok += f"\n🔥 کمبو: {combo} پاسخ پشت‌سرهم (پاداش اضافه {bonus})"
+                send(cid, msg_ok)
+                if combo >= 5: grant_ach(uid, "combo5", "🔥 کمبوی پنج‌تایی")
+                if (u["quiz_ok"] or 0) + 1 >= 1: grant_ach(uid, "first_quiz", "🧠 اولین پاسخ درست مسابقه")
+                if (u["quiz_ok"] or 0) + 1 >= 10: grant_ach(uid, "quiz10", "🎯 ده پاسخ درست")
+                if (u["points"] or 0) + gain >= 100: grant_ach(uid, "rich", "💰 رسیدن به صد امتیاز")
+            else:
+                c.execute("UPDATE users SET quiz_combo=0 WHERE user_id=?", (uid,))
+                if cat == "mix" and st and str(st["category"]).startswith("mix:"):
+                    _, qc, qi = st["category"].split(":")
+                    q, opts, correct = QUIZ[qc][int(qi)]
+                else:
+                    q, opts, correct = QUIZ[cat][idx]
+                c.execute("UPDATE quiz_state SET qindex=qindex+1 WHERE user_id=?", (uid,))
+                c.commit(); c.close()
+                send(cid, f"❌ پاسخ نادرست بود.\nجواب صحیح: {opts[correct]}\nکمبوی شما صفر شد. دوباره تلاش کنید.")
+            ask_q(cid, uid)
+        except Exception as e:
+            log.exception(e)
+    elif data.startswith("buy:"):
+        code = data.split(":", 1)[1]
+        item = next((x for x in TITLES_SHOP if x[0] == code), None)
+        if not item:
+            send(cid, "این مورد در فروشگاه یافت نشد."); return
+        code, title, price = item
+        u = user(uid)
+        if not u or (u.get("points") or 0) < price:
+            send(cid,
+                 f"❌ امتیاز کافی ندارید.\n\nقیمت این عنوان: {price} امتیاز\n"
+                 f"موجودی شما: {pts(uid)} امتیاز")
+            return
+        c = db()
+        c.execute("UPDATE users SET points=points-?, title=? WHERE user_id=?", (price, title, uid))
+        c.execute("INSERT OR IGNORE INTO inventory(user_id,item) VALUES(?,?)", (uid, code))
+        c.commit(); c.close()
+        send(cid,
+             f"✅ خرید با موفقیت انجام شد.\n\n"
+             f"🏷 عنوان جدید شما: {title}\n"
+             f"⭐ موجودی باقی‌مانده: {pts(uid)}")
+    elif data == "a_stat" and uid == ADMIN_ID:
+        c = db()
+        total = c.execute("SELECT COUNT(*) n FROM users").fetchone()["n"]
+        banned = c.execute("SELECT COUNT(*) n FROM users WHERE banned=1").fetchone()["n"]
+        ptsum = c.execute("SELECT COALESCE(SUM(points),0) s FROM users").fetchone()["s"]
+        ncount = c.execute("SELECT COUNT(*) n FROM news").fetchone()["n"]
+        sup = c.execute("SELECT COUNT(*) n FROM support WHERE answered=0").fetchone()["n"]
+        c.close()
+        chs = get_channels()
+        send(cid,
+             f"📊 آمار کامل ربات\n━━━━━━━━━━━━━━\n\n"
+             f"👥 کل کاربران: {total}\n"
+             f"🚫 مسدودشده: {banned}\n"
+             f"⭐ مجموع امتیازها: {ptsum}\n"
+             f"📰 اخبار ذخیره‌شده: {ncount}\n"
+             f"📬 پشتیبانی باز: {sup}\n"
+             f"🔐 تعداد کانال قفل: {len(chs)}", adm_kb())
+    elif data == "a_bc" and uid == ADMIN_ID:
+        state[uid] = {"m": "bc"}
+        send(cid, "📢 متن پیام همگانی را کامل بنویسید و ارسال کنید.\nبرای لغو: /cancel")
+    elif data == "a_day" and uid == ADMIN_ID:
+        state[uid] = {"m": "news", "k": "day"}
+        send(cid, "📰 خبر روز\nخط اول را تیتر بنویسید و از خط بعد متن کامل خبر را وارد کنید.")
+    elif data == "a_urg" and uid == ADMIN_ID:
+        state[uid] = {"m": "news", "k": "urgent"}
+        send(cid, "🚨 خبر فوری\nخط اول تیتر و خطوط بعد متن خبر باشد.")
+    elif data == "a_rss" and uid == ADMIN_ID:
+        last_news_fetch = 0
+        fetch_rss_news()
+        send(cid, "✅ دریافت اخبار از منابع انجام شد.", adm_kb())
+    elif data == "a_ad_set" and uid == ADMIN_ID:
+        state[uid] = {"m": "ad_set"}
+        send(cid,
+             "📣 متن تبلیغ قبل از استارت را کامل بفرستید.\n"
+             "این متن قبل از خوش‌آمد و قفل عضویت برای کاربر نمایش داده می‌شود.\n"
+             "لغو: /cancel")
+    elif data == "a_ad_del" and uid == ADMIN_ID:
+        set_setting("start_ad", "")
+        send(cid, "✅ تبلیغ استارت حذف شد. دیگر قبل از ورود چیزی نمایش داده نمی‌شود.", adm_kb())
+    elif data == "a_ad_view" and uid == ADMIN_ID:
+        ad = get_setting("start_ad", "").strip()
+        send(cid, "👁 تبلیغ فعلی:\n\n" + (ad if ad else "(خالی — تبلیغی تنظیم نشده)"), adm_kb())
+    elif data == "a_ch_list" and uid == ADMIN_ID:
+        chs = get_channels()
+        if not chs:
+            send(cid, "🔐 هیچ کانال قفلی ثبت نشده است.", adm_kb())
+        else:
+            lines = "\n".join(f"• @{u} — {t}" for u, t in chs)
+            send(cid, f"🔐 کانال‌های قفل عضویت:\n\n{lines}", adm_kb())
+    elif data == "a_ch_add" and uid == ADMIN_ID:
+        state[uid] = {"m": "ch_add"}
+        send(cid,
+             "➕ افزودن کانال به قفل عضویت\n\n"
+             "به این شکل بفرستید:\n"
+             "یوزرنیم | عنوان نمایشی\n\n"
+             "مثال:\npartnews | 📢 کانال اخبار\n\n"
+             "ربات باید در آن کانال ادمین باشد.\nلغو: /cancel")
+    elif data == "a_ch_del" and uid == ADMIN_ID:
+        state[uid] = {"m": "ch_del"}
+        send(cid, "➖ یوزرنیم کانالی که می‌خواهید از قفل حذف شود را بفرستید (بدون @).\nلغو: /cancel")
+    elif data == "a_give" and uid == ADMIN_ID:
+        state[uid] = {"m": "give"}
+        send(cid, "⭐ به این شکل بفرستید:\nآیدی‌عددی فاصله امتیاز\nمثال:\n1196063545 50\nلغو: /cancel")
+    elif data == "a_ban" and uid == ADMIN_ID:
+        state[uid] = {"m": "ban"}
+        send(cid, "🚫 آیدی عددی کاربری که باید مسدود شود را بفرستید.\nلغو: /cancel")
+    elif data == "a_unban" and uid == ADMIN_ID:
+        state[uid] = {"m": "unban"}
+        send(cid, "✅ آیدی عددی کاربر برای رفع مسدودی را بفرستید.\nلغو: /cancel")
+    elif data == "a_support" and uid == ADMIN_ID:
+        c = db()
+        rows = c.execute(
+            "SELECT user_id,message,created_at FROM support WHERE answered=0 ORDER BY id DESC LIMIT 10"
+        ).fetchall()
+        c.close()
+        if not rows:
+            send(cid, "📬 پشتیبانی باز وجود ندارد.", adm_kb())
+        else:
+            lines = ["📬 آخرین پیام‌های پشتیبانی باز:\n"]
+            for r in rows:
+                lines.append(f"• {r['user_id']} | {r['created_at']}\n{r['message'][:80]}...\n/reply_{r['user_id']}\n")
+            send(cid, "\n".join(lines), adm_kb())
+
+def main():
+    if not TOKEN or TOKEN == "YOUR_BOT_TOKEN":
+        print("لطفاً TOKEN را تنظیم کنید")
+        return
+    init_db()
+    me = api("getMe")
+    if not me.get("ok"):
+        print("توکن نامعتبر:", me)
+        return
+    print("ربات روشن شد")
+    fetch_rss_news()
+    offset = 0
+    while True:
+        try:
+            if time.time() - last_news_fetch >= NEWS_INTERVAL:
+                fetch_rss_news()
+            res = requests.get(API + "getUpdates", params={"offset": offset, "timeout": 20}, timeout=25).json()
+            if not res.get("ok"):
+                time.sleep(1); continue
+            for u in res.get("result") or []:
+                offset = u["update_id"] + 1
+                try:
+                    if "callback_query" in u:
+                        on_cb(u["callback_query"])
+                    elif "message" in u:
+                        on_msg(u["message"])
+                except Exception as e:
+                    log.exception(e)
+        except Exception as e:
+            log.exception(e)
+            time.sleep(2)
+
+if __name__ == "__main__":
+    main()
